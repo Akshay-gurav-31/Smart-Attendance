@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Face Detection & Embedding Test</title>
+  <style>
+    body { font-family: Arial; max-width: 800px; margin: 20px auto; text-align: center; }
+    #videoContainer { position: relative; display: inline-block; }
+    video, canvas { display: block; border: 2px solid #333; border-radius: 8px; }
+    canvas { position: absolute; top: 0; left: 0; }
+    #status { font-weight: bold; margin: 10px 0; }
+    .error { color: red; }
+    .success { color: green; }
+    input, button { margin: 8px; padding: 6px 12px; }
+  </style>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_detection"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils"></script>
+</head>
+
+<body>
+  <h2>Face Detection & Embedding Test</h2>
+  <input type="text" id="studentId" placeholder="Enter Student ID" />
+  <div id="videoContainer">
+    <video id="webcam" width="640" height="480" autoplay playsinline muted></video>
+    <canvas id="output" width="640" height="480"></canvas>
+  </div>
+  <p id="status">Click "Start Camera" to begin</p>
+  <button id="startBtn">Start Camera</button>
+  <button id="stopBtn" disabled>Stop Camera</button>
+
+  <script>
+    const videoElement = document.getElementById('webcam');
+    const canvasElement = document.getElementById('output');
+    const canvasCtx = canvasElement.getContext('2d');
+    const statusEl = document.getElementById('status');
+    const startBtn = document.getElementById('startBtn');
+    const stopBtn = document.getElementById('stopBtn');
+    const studentInput = document.getElementById('studentId');
+
+    let camera = null;
+    let stream = null;
+    let sending = false;
+    let lastEmbedding = null;
+    let lastSentTime = 0;
+    const THROTTLE_TIME = 5000; // ms between sends
+
+    const faceDetection = new FaceDetection({
+      locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_detection/${file}`
+    });
+
+    faceDetection.setOptions({
+      model: 'short',
+      minDetectionConfidence: 0.5
+    });
+
+    faceDetection.onResults(onResults);
+
+    function onResults(results) {
+      canvasCtx.save();
+      canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+      canvasCtx.drawImage(results.image, 0, 0, canvasElement.width, canvasElement.height);
+
+      if (results.detections && results.detections.length > 0) {
+        statusEl.innerText = `Faces detected: ${results.detections.length}`;
+
+        for (const detection of results.detections) {
+          const bbox = detection.boundingBox;
+          const x = bbox.xCenter * canvasElement.width - (bbox.width * canvasElement.width) / 2;
+          const y = bbox.yCenter * canvasElement.height - (bbox.height * canvasElement.height) / 2;
+          const width = bbox.width * canvasElement.width;
+          const height = bbox.height * canvasElement.height;
+
+          // Draw rectangle
+          canvasCtx.strokeStyle = '#00FF00';
+          canvasCtx.lineWidth = 2;
+          canvasCtx.strokeRect(x, y, width, height);
+
+          const now = Date.now();
+          if (!sending && now - lastSentTime > THROTTLE_TIME) {
+            sending = true;
+            cropAndSendFace(x, y, width, height);
+            lastSentTime = now;
+          }
+        }
+      } else {
+        statusEl.innerText = "No faces detected";
+      }
+
+      canvasCtx.restore();
+    }
+
+    async function cropAndSendFace(x, y, w, h) {
+      const scale = 0.9; // tighter crop
+      const cx = x + w / 2;
+      const cy = y + h / 2;
+      const newW = w * scale;
+      const newH = h * scale;
+      const newX = cx - newW / 2;
+      const newY = cy - newH / 2;
+
+      const tempCanvas = document.createElement('canvas');
+      tempCanvas.width = newW;
+      tempCanvas.height = newH;
+      const tempCtx = tempCanvas.getContext('2d');
+      tempCtx.drawImage(canvasElement, newX, newY, newW, newH, 0, 0, newW, newH);
+
+      tempCanvas.toBlob(async (blob) => {
+        try {
+          const formData = new FormData();
+          const studentId = studentInput.value.trim() || 'unknown';
+          formData.append('student_id', studentId);
+          formData.append('photo', blob, 'face.jpg');
+
+          const response = await fetch('http://localhost:8000/api/detect-and-embed', {
+            method: 'POST',
+            body: formData
+          });
+
+          const result = await response.json();
+          console.log('Embedding result:', result);
+
+          if (result.embedding) {
+            if (!lastEmbedding || !areEmbeddingsSimilar(lastEmbedding, result.embedding)) {
+              lastEmbedding = result.embedding;
+              statusEl.textContent = "✅ Face stored successfully!";
+              stopCamera();
+              alert("✅ Face successfully stored for student: " + studentId);
+            } else {
+              statusEl.textContent = "⚠️ Duplicate face skipped.";
+            }
+          } else {
+            statusEl.textContent = result.message || "No embedding received";
+          }
+        } catch (err) {
+          console.error('Error sending face:', err);
+          statusEl.textContent = "❌ Server error.";
+        } finally {
+          sending = false;
+        }
+      }, 'image/jpeg');
+    }
+
+    function areEmbeddingsSimilar(e1, e2, threshold = 0.9) {
+      let dot = 0, norm1 = 0, norm2 = 0;
+      for (let i = 0; i < e1.length; i++) {
+        dot += e1[i] * e2[i];
+        norm1 += e1[i] ** 2;
+        norm2 += e2[i] ** 2;
+      }
+      const sim = dot / (Math.sqrt(norm1) * Math.sqrt(norm2));
+      return sim > threshold;
+    }
+
+    async function startCamera() {
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ video: true });
+        videoElement.srcObject = stream;
+
+        camera = new Camera(videoElement, {
+          onFrame: async () => await faceDetection.send({ image: videoElement }),
+          width: 640,
+          height: 480
+        });
+        await camera.start();
+
+        startBtn.disabled = true;
+        stopBtn.disabled = false;
+        statusEl.innerText = "Camera running...";
+      } catch (err) {
+        console.error(err);
+        statusEl.innerText = "Cannot access camera";
+      }
+    }
+
+    function stopCamera() {
+      if (camera) camera.stop();
+      if (stream) stream.getTracks().forEach(track => track.stop());
+      videoElement.srcObject = null;
+      startBtn.disabled = false;
+      stopBtn.disabled = true;
+      statusEl.innerText = "Camera stopped";
+    }
+
+    startBtn.addEventListener('click', startCamera);
+    stopBtn.addEventListener('click', stopCamera);
+  </script>
+</body>
+</html>
