@@ -1,0 +1,7 @@
+fastapi>=0.104
+uvicorn>=0.24
+python-multipart>=0.0.6
+opencv-python-headless>=4.8.1.78
+mediapipe>=0.10
+insightface>=0.7
+numpy>=1.24
